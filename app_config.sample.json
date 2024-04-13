@@ -1,0 +1,13 @@
+{
+    "coingecko_api_key": "CG-.................",
+    "tickers": [
+        {
+            "ticker": "ADAUSD",
+            "name": "cardano",
+            "crypto": true,
+            "frequency": 63,
+            "decimals": 2,
+            "discord_bot_token": "${{ secrets.DISCORD_BOT_ADAUSD_TOKEN }}"
+        }
+    ]
+}
