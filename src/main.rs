@@ -1,15 +1,18 @@
 use crate::quote::req_consumer::consume_crypto_price_requests;
 use crate::quote::request::AssetQuoteRequest;
+use bigdecimal;
 use serde::Deserialize;
 use serde_json;
-use std::fs;
 use std::io::Result;
-use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::str::FromStr;
 use std::time;
-
+use tokio::fs;
+use tokio::signal;
+use tokio::sync::mpsc;
+use tokio::sync::oneshot;
+use tokio::time::timeout;
 mod quote;
+use bigdecimal::{BigDecimal, FromPrimitive, RoundingMode};
 
 #[derive(Debug, Deserialize)]
 struct Config {
@@ -27,142 +30,208 @@ struct TickerConfig {
     discord_bot_token: String, // Field to store the Discord bot token for authentication
 }
 
-fn read_config(file_path: &str) -> Result<Config> {
-    let config_string = fs::read_to_string(file_path)?;
+async fn read_config(file_path: &str) -> Result<Config> {
+    let config_string = fs::read_to_string(file_path).await?;
     let config: Config = serde_json::from_str(config_string.as_str())?;
     Ok(config)
 }
 
-fn spawn_job(
+async fn do_timed_job_indefinitely(
     ticker_config: TickerConfig,
-    stop_flag: Arc<Mutex<bool>>,
-    job_sender: Sender<AssetQuoteRequest>,
+    mut stop_signal_recv: oneshot::Receiver<()>,
+    job_sender: mpsc::UnboundedSender<AssetQuoteRequest>,
 ) {
     const VS_CURRENCY: &str = "usd";
     const VS_CURRENCY_SYMBOL_PREFIX: &str = "$";
     const VS_CURRENCY_SYMBOL_SUFFIX: &str = "";
 
-    macro_rules! check_and_break {
-        ($stop_flag:expr) => {
-            if *$stop_flag.lock().unwrap() {
-                break;
+    macro_rules! break_if_signaled {
+        ($stop_signal_recv:expr) => {
+            match $stop_signal_recv.try_recv() {
+                Ok(_) => {
+                    println!("Stop signal received for {}", ticker_config.ticker);
+                    let _ = stop_signal_recv.await;
+                    break;
+                }
+                Err(e) => {
+                    if e != oneshot::error::TryRecvError::Empty {
+                        println!(
+                            "Error receiving stop signal for {}: {}",
+                            ticker_config.ticker, e
+                        );
+                        break;
+                    }
+                }
             }
         };
     }
 
-    thread::spawn(move || {
-        let tick_duration = time::Duration::from_secs(ticker_config.frequency);
-        let (get_price_chan_sender, get_price_chan_receiver) = mpsc::channel();
+    let tick_duration = time::Duration::from_secs(ticker_config.frequency);
+    let (get_price_chan_sender, mut get_price_chan_receiver) = mpsc::unbounded_channel();
 
-        loop {
-            check_and_break!(stop_flag);
+    loop {
+        break_if_signaled!(&mut stop_signal_recv);
 
-            let formatted_price_usd: String;
-            let formatted_price_change_24h: String;
+        let formatted_price_usd: String;
+        let formatted_price_change_24h: String;
 
+        println!(
+            "Timer ticked for {}, fetching price...",
+            ticker_config.ticker
+        );
+
+        let id = &ticker_config.name;
+
+        let crypto_price_request = AssetQuoteRequest {
+            name: id.to_string(),
+            vs_currency: VS_CURRENCY.to_string(),
+            resp_sender: get_price_chan_sender.clone(),
+        };
+
+        if let Err(e) = job_sender.send(crypto_price_request) {
             println!(
-                "Timer ticked for {}, fetching price...",
+                "cannot send crypto price request to channel for {}, stopping: {}",
+                id, e
+            );
+            break;
+        }
+
+        let get_price_chan_response = match get_price_chan_receiver.recv().await {
+            Some(r) => r,
+            None => {
+                println!(
+                    "get crypto price response channel of '{}' is closed, will retry if possible",
+                    ticker_config.ticker
+                );
+                continue;
+            }
+        };
+
+        let get_price_response = match get_price_chan_response {
+            Ok(r) => r,
+            Err(error) => {
+                println!(
+                    "Error getting price for {}: {}",
+                    ticker_config.ticker, error
+                );
+                tokio::time::sleep(tick_duration).await;
+                continue;
+            }
+        };
+
+        let price_usd = get_price_response.price_usd;
+        let price_change_24h = get_price_response.price_change_24h;
+
+        if price_usd.fractional_digit_count() > ticker_config.decimals as i64 {
+            formatted_price_usd = price_usd
+                .with_scale_round(ticker_config.decimals.into(), RoundingMode::HalfEven)
+                .to_string();
+        } else {
+            formatted_price_usd = price_usd.to_string();
+        }
+
+        formatted_price_change_24h = format!("{:.*}", 2, price_change_24h);
+        println!(
+            "Price for {} is {} USD (original value: {}), change in 24h is {}%",
+            ticker_config.ticker, formatted_price_usd, price_usd, formatted_price_change_24h
+        );
+
+        break_if_signaled!(&mut stop_signal_recv);
+
+        let discord_bot_name: String;
+        if VS_CURRENCY_SYMBOL_SUFFIX.is_empty() {
+            discord_bot_name = format!("{}{}", VS_CURRENCY_SYMBOL_PREFIX, formatted_price_usd);
+        } else {
+            discord_bot_name = format!(
+                "{}{} {}",
+                VS_CURRENCY_SYMBOL_PREFIX, formatted_price_usd, VS_CURRENCY_SYMBOL_SUFFIX
+            );
+        }
+
+        let discord_bot_status =
+            format!("{}% | {}", formatted_price_change_24h, ticker_config.ticker);
+
+        println!(
+            "Update Discord bot name for {}, set to {} ({})...",
+            ticker_config.ticker, discord_bot_name, discord_bot_status
+        );
+        // TODO: update Discord bot name
+
+        break_if_signaled!(&mut stop_signal_recv);
+
+        if let Ok(_) = timeout(tick_duration, &mut stop_signal_recv).await {
+            println!(
+                "Received stop signal for {}, quit loop",
                 ticker_config.ticker
             );
-
-            let id = &ticker_config.name;
-
-            let crypto_price_request = AssetQuoteRequest {
-                name: id.to_string(),
-                vs_currency: VS_CURRENCY.to_string(),
-                resp_sender: get_price_chan_sender.clone(),
-            };
-            job_sender.send(crypto_price_request).unwrap();
-
-            let get_price_chan_response = match get_price_chan_receiver.recv() {
-                Ok(r) => r,
-                Err(error) => {
-                    println!(
-                        "Error receiving response from channel for {}: {}",
-                        ticker_config.ticker, error
-                    );
-                    thread::sleep(tick_duration);
-                    continue;
-                }
-            };
-
-            let get_price_response = match get_price_chan_response {
-                Ok(r) => r,
-                Err(error) => {
-                    println!(
-                        "Error getting price for {}: {}",
-                        ticker_config.ticker, error
-                    );
-                    thread::sleep(tick_duration);
-                    continue;
-                }
-            };
-
-            let price_usd = get_price_response.price_usd;
-            let price_change_24h = get_price_response.price_change_24h;
-
-            formatted_price_usd = format!("{:.*}", ticker_config.decimals as usize, price_usd);
-            formatted_price_change_24h = format!("{:.*}", 2, price_change_24h);
-            println!(
-                "Price for {} is {} USD, change in 24h is {}%",
-                ticker_config.ticker, formatted_price_usd, formatted_price_change_24h
-            );
-
-            check_and_break!(stop_flag);
-
-            let discord_bot_name: String;
-            if VS_CURRENCY_SYMBOL_SUFFIX.is_empty() {
-                discord_bot_name = format!("{}{}", VS_CURRENCY_SYMBOL_PREFIX, formatted_price_usd);
-            } else {
-                discord_bot_name = format!(
-                    "{}{} {}",
-                    VS_CURRENCY_SYMBOL_PREFIX, formatted_price_usd, VS_CURRENCY_SYMBOL_SUFFIX
-                );
-            }
-
-            let discord_bot_status =
-                format!("{}% | {}", formatted_price_change_24h, ticker_config.ticker);
-
-            println!(
-                "Update Discord bot name for {}, set to {} ({})...",
-                ticker_config.ticker, discord_bot_name, discord_bot_status
-            );
-            // TODO: update Discord bot name
-
-            check_and_break!(stop_flag);
-
-            thread::sleep(tick_duration);
+            break;
         }
-    });
+    }
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     println!("Hello, world!");
-    let read_result = read_config("app_config.json");
+    let read_result = read_config("app_config.json").await;
 
-    if let Ok(config) = read_result {
-        let stop_flag = Arc::new(Mutex::new(false));
-        let (crypto_price_req_sender, crypto_price_req_receiver) = mpsc::channel();
-        // let (stock_price_req_sender, stock_price_req_receiver) = mpsc::channel();
+    let config = match read_result {
+        Ok(config) => config,
+        Err(error) => {
+            println!("Error reading config file: {}", error);
+            return;
+        }
+    };
 
-        for ticker_config in config.tickers {
-            println!("Loaded config for ticker: {}", ticker_config.ticker);
-            if ticker_config.crypto {
-                spawn_job(ticker_config, Arc::clone(&stop_flag), crypto_price_req_sender.clone());
-            } else {
-                // TODO: implement stock price fetching
-                // spawn_job(ticker_config, Arc::clone(&stop_flag), stock_price_req_sender.clone());
-                println!("TBD: stock price fetching not implemented yet")
+    let (crypto_price_req_sender, crypto_price_req_receiver) = mpsc::unbounded_channel();
+    // let (stock_price_req_sender, stock_price_req_receiver) = mpsc::unbounded_channel();
+
+    let mut tasks = Vec::new();
+    let mut stop_signal_channels = Vec::new();
+
+    for ticker_config in config.tickers {
+        println!("Loaded config for ticker: {}, is crypto? {}", ticker_config.ticker, ticker_config.crypto);
+        if ticker_config.crypto {
+            let crypto_price_req_sender_clone = crypto_price_req_sender.clone();
+            let (stop_signal_send, stop_signal_recv) = oneshot::channel();
+
+            tasks.push(tokio::spawn(async move {
+                do_timed_job_indefinitely(
+                    ticker_config,
+                    stop_signal_recv,
+                    crypto_price_req_sender_clone,
+                )
+                .await;
+            }));
+
+            stop_signal_channels.push(stop_signal_send);
+        } else {
+            // TODO: implement stock price fetching
+            // spawn_job(ticker_config, Arc::clone(&stop_flag), stock_price_req_sender.clone());
+            println!("TBD: ticker {} is not an US stock, not implemented yet", ticker_config.ticker)
+        }
+    }
+
+    let coingecko_api_key = config.coingecko_api_key.to_string();
+    tokio::spawn(async move {
+        consume_crypto_price_requests(crypto_price_req_receiver, coingecko_api_key).await;
+    });
+
+    // consume_stock_price_requests(stock_price_req_receiver, ...);
+
+    tokio::spawn(async move {
+        signal::ctrl_c().await.expect("failed to listen for event");
+
+        println!("Ctrl+C pressed. Stopping...");
+
+        for stop_signal in stop_signal_channels {
+            if let Err(_) = stop_signal.send(()) {
+                println!("one of the stop signal receivers dropped");
             }
         }
+    });
 
-        consume_crypto_price_requests(crypto_price_req_receiver, config.coingecko_api_key);
-        // consume_stock_price_requests(stock_price_req_receiver, ...);
-
-        // blockingly wait for all threads to finish
-        println!("Waiting for all threads to finish...");
-        thread::park();
-    } else {
-        println!("Error reading config file: {}", read_result.unwrap_err());
+    println!("Waiting for all tasks to finish...");
+    for task in tasks {
+        let _ = task.await;
     }
 }

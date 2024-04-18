@@ -1,11 +1,11 @@
 use crate::quote::error::QuoteRequestError;
 use crate::quote::response::AssetQuoteResponse;
 use std::result;
-use std::sync::mpsc::Sender;
+use tokio::sync::mpsc::UnboundedSender;
 
 #[derive(Debug)]
 pub struct AssetQuoteRequest {
     pub name: String,
     pub vs_currency: String,
-    pub resp_sender: Sender<result::Result<AssetQuoteResponse, QuoteRequestError>>,
+    pub resp_sender: UnboundedSender<result::Result<AssetQuoteResponse, QuoteRequestError>>,
 }
