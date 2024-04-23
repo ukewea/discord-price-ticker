@@ -4,15 +4,21 @@ use bigdecimal;
 use serde::Deserialize;
 use serde_json;
 use std::io::Result;
-use std::str::FromStr;
 use std::time;
 use tokio::fs;
 use tokio::signal;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
+use tracing::debug;
+use tracing::trace;
+use tracing::warn;
 mod quote;
-use bigdecimal::{BigDecimal, FromPrimitive, RoundingMode};
+use bigdecimal::RoundingMode;
+use tracing::info;
+use tracing::instrument;
+use tracing::Level;
+use tracing_subscriber;
 
 #[derive(Debug, Deserialize)]
 struct Config {
@@ -36,7 +42,8 @@ async fn read_config(file_path: &str) -> Result<Config> {
     Ok(config)
 }
 
-async fn do_timed_job_indefinitely(
+#[instrument(skip_all, fields(ticker = ticker_config.ticker))]
+async fn run_periodic_job_loop(
     ticker_config: TickerConfig,
     mut stop_signal_recv: oneshot::Receiver<()>,
     job_sender: mpsc::UnboundedSender<AssetQuoteRequest>,
@@ -49,13 +56,13 @@ async fn do_timed_job_indefinitely(
         ($stop_signal_recv:expr) => {
             match $stop_signal_recv.try_recv() {
                 Ok(_) => {
-                    println!("Stop signal received for {}", ticker_config.ticker);
+                    info!("Stop signal received for {}", ticker_config.ticker);
                     let _ = stop_signal_recv.await;
                     break;
                 }
                 Err(e) => {
                     if e != oneshot::error::TryRecvError::Empty {
-                        println!(
+                        warn!(
                             "Error receiving stop signal for {}: {}",
                             ticker_config.ticker, e
                         );
@@ -75,7 +82,7 @@ async fn do_timed_job_indefinitely(
         let formatted_price_usd: String;
         let formatted_price_change_24h: String;
 
-        println!(
+        debug!(
             "Timer ticked for {}, fetching price...",
             ticker_config.ticker
         );
@@ -89,7 +96,7 @@ async fn do_timed_job_indefinitely(
         };
 
         if let Err(e) = job_sender.send(crypto_price_request) {
-            println!(
+            tracing::error!(
                 "cannot send crypto price request to channel for {}, stopping: {}",
                 id, e
             );
@@ -99,7 +106,7 @@ async fn do_timed_job_indefinitely(
         let get_price_chan_response = match get_price_chan_receiver.recv().await {
             Some(r) => r,
             None => {
-                println!(
+                warn!(
                     "get crypto price response channel of '{}' is closed, will retry if possible",
                     ticker_config.ticker
                 );
@@ -110,7 +117,7 @@ async fn do_timed_job_indefinitely(
         let get_price_response = match get_price_chan_response {
             Ok(r) => r,
             Err(error) => {
-                println!(
+                warn!(
                     "Error getting price for {}: {}",
                     ticker_config.ticker, error
                 );
@@ -131,7 +138,7 @@ async fn do_timed_job_indefinitely(
         }
 
         formatted_price_change_24h = format!("{:.*}", 2, price_change_24h);
-        println!(
+        debug!(
             "Price for {} is {} USD (original value: {}), change in 24h is {}%",
             ticker_config.ticker, formatted_price_usd, price_usd, formatted_price_change_24h
         );
@@ -151,7 +158,7 @@ async fn do_timed_job_indefinitely(
         let discord_bot_status =
             format!("{}% | {}", formatted_price_change_24h, ticker_config.ticker);
 
-        println!(
+        debug!(
             "Update Discord bot name for {}, set to {} ({})...",
             ticker_config.ticker, discord_bot_name, discord_bot_status
         );
@@ -160,7 +167,7 @@ async fn do_timed_job_indefinitely(
         break_if_signaled!(&mut stop_signal_recv);
 
         if let Ok(_) = timeout(tick_duration, &mut stop_signal_recv).await {
-            println!(
+            info!(
                 "Received stop signal for {}, quit loop",
                 ticker_config.ticker
             );
@@ -171,13 +178,17 @@ async fn do_timed_job_indefinitely(
 
 #[tokio::main]
 async fn main() {
-    println!("Hello, world!");
+    tracing_subscriber::fmt()
+        .with_max_level(Level::DEBUG)
+        .init();
+
+    info!("Hello, world!");
     let read_result = read_config("app_config.json").await;
 
     let config = match read_result {
         Ok(config) => config,
         Err(error) => {
-            println!("Error reading config file: {}", error);
+            tracing::error!("Error reading config file: {}", error);
             return;
         }
     };
@@ -189,13 +200,18 @@ async fn main() {
     let mut stop_signal_channels = Vec::new();
 
     for ticker_config in config.tickers {
-        println!("Loaded config for ticker: {}, is crypto? {}", ticker_config.ticker, ticker_config.crypto);
+        debug!(
+            "Loaded config for ticker: {}, is crypto? {}",
+            ticker_config.ticker, ticker_config.crypto
+        );
         if ticker_config.crypto {
+            let ticker = ticker_config.ticker.to_string();
             let crypto_price_req_sender_clone = crypto_price_req_sender.clone();
             let (stop_signal_send, stop_signal_recv) = oneshot::channel();
 
+            trace!("Spawning task for ticker: {}", ticker);
             tasks.push(tokio::spawn(async move {
-                do_timed_job_indefinitely(
+                run_periodic_job_loop(
                     ticker_config,
                     stop_signal_recv,
                     crypto_price_req_sender_clone,
@@ -203,35 +219,46 @@ async fn main() {
                 .await;
             }));
 
-            stop_signal_channels.push(stop_signal_send);
+            trace!("Creating stop signal channel for ticker: {}", ticker);
+            stop_signal_channels.push((ticker, stop_signal_send));
         } else {
             // TODO: implement stock price fetching
             // spawn_job(ticker_config, Arc::clone(&stop_flag), stock_price_req_sender.clone());
-            println!("TBD: ticker {} is not an US stock, not implemented yet", ticker_config.ticker)
+            warn!(
+                "TBD: ticker {} is not an US stock, not implemented yet",
+                ticker_config.ticker
+            )
         }
     }
 
     let coingecko_api_key = config.coingecko_api_key.to_string();
+    trace!("Starting crypto price request consumer...");
     tokio::spawn(async move {
         consume_crypto_price_requests(crypto_price_req_receiver, coingecko_api_key).await;
     });
 
     // consume_stock_price_requests(stock_price_req_receiver, ...);
 
+    trace!("Starting signal handler...");
     tokio::spawn(async move {
+        trace!("Waiting for Ctrl+C signal...");
         signal::ctrl_c().await.expect("failed to listen for event");
 
-        println!("Ctrl+C pressed. Stopping...");
-
-        for stop_signal in stop_signal_channels {
+        info!("Ctrl+C pressed. Stopping...");
+        for (ticker, stop_signal) in stop_signal_channels {
+            info!("Sending stop signal to receiver for ticker: {}", ticker);
             if let Err(_) = stop_signal.send(()) {
-                println!("one of the stop signal receivers dropped");
+                warn!("Stop signal receiver for ticker {} is already dropped", ticker);
+            } else {
+                info!("Stop signal sent to receiver for ticker: {}", ticker);
             }
         }
     });
 
-    println!("Waiting for all tasks to finish...");
+    info!("Waiting for all tasks to finish...");
     for task in tasks {
         let _ = task.await;
     }
+
+    info!("All tasks finished.");
 }

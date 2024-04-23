@@ -3,11 +3,15 @@ use crate::quote::request::AssetQuoteRequest;
 use crate::quote::response::AssetQuoteResponse;
 use bigdecimal::BigDecimal;
 use reqwest::header;
+use tracing::warn;
 use std::str::FromStr;
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::sleep;
+use tracing::instrument;
+use tracing::debug;
 
+#[instrument(skip(job_receiver, api_key))]
 pub async fn consume_crypto_price_requests(
     mut job_receiver: UnboundedReceiver<AssetQuoteRequest>,
     api_key: String,
@@ -28,7 +32,7 @@ pub async fn consume_crypto_price_requests(
         let http_client = reqwest::Client::new();
 
         while retry_count > 0 {
-            println!(
+            debug!(
                 "Consumer sending request for {} to CoinGecko API, retry count: {}",
                 &req.name, retry_count
             );
@@ -44,7 +48,7 @@ pub async fn consume_crypto_price_requests(
             let response = match http_req_build.send().await {
                 Ok(response) => response,
                 Err(e) => {
-                    println!(
+                    warn!(
                         "Error calling CoinGecko API to get price for {}: {}, retrying...",
                         &req.name, e
                     );
@@ -59,7 +63,7 @@ pub async fn consume_crypto_price_requests(
                 match serde_json::from_str(response.text().await.unwrap().as_str()) {
                     Ok(json) => json,
                     Err(e) => {
-                        println!(
+                        tracing::error!(
                             "Error parsing JSON response for {} using CoinGecko API: {}",
                             req.name, e
                         );
@@ -71,7 +75,7 @@ pub async fn consume_crypto_price_requests(
             let price_json = price_json.as_object().unwrap();
 
             if !price_json.contains_key(&req.name) || !price_json[&req.name].is_object() {
-                println!(
+                warn!(
                     "Error parsing JSON response for {} using CoinGecko API: {}",
                     &req.name, "missing id of the crypto, or is not an object"
                 );
@@ -84,7 +88,7 @@ pub async fn consume_crypto_price_requests(
             if !price_json_target_symbol.contains_key("usd")
                 || !price_json_target_symbol.contains_key("usd_24h_change")
             {
-                println!(
+                warn!(
                     "Error parsing JSON response for {} using CoinGecko API: {}",
                     &req.name, "missing usd and/or usd_24h_change field(s)"
                 );
@@ -95,7 +99,7 @@ pub async fn consume_crypto_price_requests(
             let price_usd = match price_json_target_symbol["usd"].as_number() {
                 Some(value) => value,
                 None => {
-                    println!(
+                    warn!(
                         "Error parsing USD price for {} using CoinGecko API: {}",
                         &req.name, "missing field"
                     );
@@ -107,7 +111,7 @@ pub async fn consume_crypto_price_requests(
             let price_usd: BigDecimal = match BigDecimal::from_str(price_usd.as_str()) {
                 Ok(value) => value,
                 Err(error) => {
-                    println!(
+                    warn!(
                         "Error parsing USD price as BigDecimal for {} using CoinGecko API: {}",
                         &req.name, error
                     );
@@ -119,7 +123,7 @@ pub async fn consume_crypto_price_requests(
             let price_change_24h = match price_json_target_symbol["usd_24h_change"].as_f64() {
                 Some(value) => value,
                 None => {
-                    println!(
+                    warn!(
                         "Error parsing 24h change for {} using CoinGecko API: {}",
                         &req.name, "missing field"
                     );
@@ -139,7 +143,7 @@ pub async fn consume_crypto_price_requests(
         if retry_count <= 0 {
             let _ = match req.resp_sender.send(Err(err)) {
                 Ok(_) => {}
-                Err(error) => println!(
+                Err(error) => tracing::error!(
                     "Error sending response to channel for {}: {}",
                     &req.name, error
                 ),
@@ -147,7 +151,7 @@ pub async fn consume_crypto_price_requests(
         } else {
             let _ = match req.resp_sender.send(Ok(result)) {
                 Ok(_) => {}
-                Err(error) => println!(
+                Err(error) => tracing::error!(
                     "Error sending response to channel for {}: {}",
                     &req.name, error
                 ),
