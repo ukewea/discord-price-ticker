@@ -62,3 +62,14 @@ impl From<String> for QuoteRequestError {
         QuoteRequestError::Other(err)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_display_other_error() {
+        let err = QuoteRequestError::Other("test".to_string());
+        assert_eq!("Other Error: test", format!("{}", err));
+    }
+}

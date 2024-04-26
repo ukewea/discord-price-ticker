@@ -3,6 +3,7 @@ use crate::quote::request::AssetQuoteRequest;
 use bigdecimal;
 use serde::Deserialize;
 use serde_json;
+use tracing_subscriber::fmt::format;
 use std::io::Result;
 use std::time;
 use tokio::fs;
@@ -79,9 +80,6 @@ async fn run_periodic_job_loop(
     loop {
         break_if_signaled!(&mut stop_signal_recv);
 
-        let formatted_price_usd: String;
-        let formatted_price_change_24h: String;
-
         debug!(
             "Timer ticked for {}, fetching price...",
             ticker_config.ticker
@@ -129,15 +127,9 @@ async fn run_periodic_job_loop(
         let price_usd = get_price_response.price_usd;
         let price_change_24h = get_price_response.price_change_24h;
 
-        if price_usd.fractional_digit_count() > ticker_config.decimals as i64 {
-            formatted_price_usd = price_usd
-                .with_scale_round(ticker_config.decimals.into(), RoundingMode::HalfEven)
-                .to_string();
-        } else {
-            formatted_price_usd = price_usd.to_string();
-        }
+        let formatted_price_usd = format_price(&price_usd, ticker_config.decimals);
+        let formatted_price_change_24h = format_price_change(price_change_24h);
 
-        formatted_price_change_24h = format!("{:.*}", 2, price_change_24h);
         debug!(
             "Price for {} is {} USD (original value: {}), change in 24h is {}%",
             ticker_config.ticker, formatted_price_usd, price_usd, formatted_price_change_24h
@@ -145,18 +137,9 @@ async fn run_periodic_job_loop(
 
         break_if_signaled!(&mut stop_signal_recv);
 
-        let discord_bot_name: String;
-        if VS_CURRENCY_SYMBOL_SUFFIX.is_empty() {
-            discord_bot_name = format!("{}{}", VS_CURRENCY_SYMBOL_PREFIX, formatted_price_usd);
-        } else {
-            discord_bot_name = format!(
-                "{}{} {}",
-                VS_CURRENCY_SYMBOL_PREFIX, formatted_price_usd, VS_CURRENCY_SYMBOL_SUFFIX
-            );
-        }
+        let discord_bot_name = generate_discord_bot_name(formatted_price_usd.as_str(), VS_CURRENCY_SYMBOL_PREFIX, VS_CURRENCY_SYMBOL_SUFFIX);
 
-        let discord_bot_status =
-            format!("{}% | {}", formatted_price_change_24h, ticker_config.ticker);
+        let discord_bot_status = generate_discord_bot_status(formatted_price_change_24h.as_str(), ticker_config.ticker.as_str());
 
         debug!(
             "Update Discord bot name for {}, set to {} ({})...",
@@ -174,6 +157,44 @@ async fn run_periodic_job_loop(
             break;
         }
     }
+}
+
+fn format_price(price: &bigdecimal::BigDecimal, decimals: u8) -> String {
+    if price.fractional_digit_count() > decimals as i64 {
+        return price
+           .with_scale_round(decimals.into(), RoundingMode::HalfEven)
+           .to_string();
+    } else {
+        return price.to_string();
+    }
+}
+
+fn format_price_change(price_change: f64) -> String {
+    // if price change > 0, add a plus sign
+    if price_change >= 0.0 {
+        return format!("+{:.*}%", 2, price_change)
+    }
+
+    format!("{:.*}%", 2, price_change)
+}
+
+fn generate_discord_bot_name(
+    formatted_price: &str,
+    vs_currency_symbol_prefix: &str,
+    vs_currency_symbol_suffix: &str,
+) -> String {
+    if vs_currency_symbol_suffix.is_empty() {
+        return format!("{}{}", vs_currency_symbol_prefix, formatted_price);
+    }
+    
+    format!(
+        "{}{} {}",
+        vs_currency_symbol_prefix, formatted_price, vs_currency_symbol_suffix
+    )
+}
+
+fn generate_discord_bot_status(formatted_price_change: &str, ticker: &str) -> String {
+    format!("{}% | {}", formatted_price_change, ticker)
 }
 
 #[tokio::main]
@@ -261,4 +282,42 @@ async fn main() {
     }
 
     info!("All tasks finished.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn test_format_price() {
+        let price = bigdecimal::BigDecimal::from_str("123456789.123456789").unwrap();
+        assert_eq!("123456789", format_price(&price, 0));
+        assert_eq!("123456789.12", format_price(&price, 2));
+        assert_eq!("123456789.123456789", format_price(&price, 9));
+        assert_eq!("123456789.123456789", format_price(&price, 10));
+    }
+
+    #[test]
+    fn test_format_price_change() {
+        assert_eq!("+12.34%", format_price_change(12.34));
+        assert_eq!("-0.12%", format_price_change(-0.12));
+        assert_eq!("+0.00%", format_price_change(0.0));
+    }
+
+    #[test]
+    fn test_generate_discord_bot_name() {
+        assert_eq!("$1234.56", generate_discord_bot_name("1234.56", "$", ""));
+        assert_eq!("$1234.56   space  ", generate_discord_bot_name("1234.56", "$", "  space  "));
+        assert_eq!("$1234.56 USD", generate_discord_bot_name("1234.56", "$", "USD"));
+        assert_eq!("1234.56 USD", generate_discord_bot_name("1234.56", "", "USD"));
+        assert_eq!("1234.56", generate_discord_bot_name("1234.56", "", ""));
+    }
+
+    #[test]
+    fn test_generate_discord_bot_status() {
+        assert_eq!("+12.34% | TICKER", generate_discord_bot_status("+12.34", "TICKER"));
+        assert_eq!("-0.12% | TICKER", generate_discord_bot_status("-0.12", "TICKER"));
+        assert_eq!("+0.00% | TICKER", generate_discord_bot_status("+0.00", "TICKER"));
+    }
 }
