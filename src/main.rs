@@ -1,7 +1,4 @@
-use crate::quote::req_consumer::consume_crypto_price_requests;
-use crate::quote::request::AssetQuoteRequest;
 use bigdecimal;
-use serde::Deserialize;
 use serde_json;
 use tracing_subscriber::fmt::format;
 use std::io::Result;
@@ -14,28 +11,24 @@ use tokio::time::timeout;
 use tracing::debug;
 use tracing::trace;
 use tracing::warn;
-mod quote;
 use bigdecimal::RoundingMode;
 use tracing::info;
+use tracing::error;
 use tracing::instrument;
 use tracing::Level;
 use tracing_subscriber;
 
-#[derive(Debug, Deserialize)]
-struct Config {
-    coingecko_api_key: String, // Field to store the CoinGecko API key for fetching crypto prices
-    tickers: Vec<TickerConfig>, // Field to store the list of ticker configurations
-}
+mod quote;
+mod discord;
+mod bot_update;
+mod config;
 
-#[derive(Debug, Deserialize)]
-struct TickerConfig {
-    ticker: String, // Ticker symbol, it will be displayed as status of the Discord bot
-    name: String, // Field to store the name of the ticker, if it is crypto, it will be the id in CoinGecko API
-    crypto: bool, // Field to represent whether the ticker is related to cryptocurrency
-    frequency: u64, // Field to store the frequency of updates, in seconds
-    decimals: u8, // Field to store the number of decimal places for the ticker value
-    discord_bot_token: String, // Field to store the Discord bot token for authentication
-}
+use crate::quote::req_consumer::consume_crypto_price_requests;
+use crate::quote::request::AssetQuoteRequest;
+use crate::bot_update::BotUpdateInfo;
+use crate::discord::client::DiscordClient;
+use crate::config::{Config, TickerConfig};
+
 
 async fn read_config(file_path: &str) -> Result<Config> {
     let config_string = fs::read_to_string(file_path).await?;
@@ -44,10 +37,12 @@ async fn read_config(file_path: &str) -> Result<Config> {
 }
 
 #[instrument(skip_all, fields(ticker = ticker_config.ticker))]
-async fn run_periodic_job_loop(
+async fn run_periodic_crypto_fetch_job_loop(
     ticker_config: TickerConfig,
     mut stop_signal_recv: oneshot::Receiver<()>,
     job_sender: mpsc::UnboundedSender<AssetQuoteRequest>,
+    bot_update_sender: mpsc::UnboundedSender<BotUpdateInfo>,
+    discord_client: DiscordClient,
 ) {
     const VS_CURRENCY: &str = "usd";
     const VS_CURRENCY_SYMBOL_PREFIX: &str = "$";
@@ -138,14 +133,20 @@ async fn run_periodic_job_loop(
         break_if_signaled!(&mut stop_signal_recv);
 
         let discord_bot_name = generate_discord_bot_name(formatted_price_usd.as_str(), VS_CURRENCY_SYMBOL_PREFIX, VS_CURRENCY_SYMBOL_SUFFIX);
-
         let discord_bot_status = generate_discord_bot_status(formatted_price_change_24h.as_str(), ticker_config.ticker.as_str());
 
         debug!(
             "Update Discord bot name for {}, set to {} ({})...",
             ticker_config.ticker, discord_bot_name, discord_bot_status
         );
-        // TODO: update Discord bot name
+
+        if let Err(e) = bot_update_sender.send(BotUpdateInfo {
+            name: discord_bot_name,
+            status: discord_bot_status,
+            discord_client: discord_client.clone(),
+        }) {
+            warn!("Failed to send bot update: {}", e);
+        }
 
         break_if_signaled!(&mut stop_signal_recv);
 
@@ -186,7 +187,7 @@ fn generate_discord_bot_name(
     if vs_currency_symbol_suffix.is_empty() {
         return format!("{}{}", vs_currency_symbol_prefix, formatted_price);
     }
-    
+
     format!(
         "{}{} {}",
         vs_currency_symbol_prefix, formatted_price, vs_currency_symbol_suffix
@@ -204,9 +205,8 @@ async fn main() {
         .init();
 
     info!("Hello, world!");
-    let read_result = read_config("app_config.json").await;
 
-    let config = match read_result {
+    let config = match read_config("app_config.json").await {
         Ok(config) => config,
         Err(error) => {
             tracing::error!("Error reading config file: {}", error);
@@ -216,6 +216,7 @@ async fn main() {
 
     let (crypto_price_req_sender, crypto_price_req_receiver) = mpsc::unbounded_channel();
     // let (stock_price_req_sender, stock_price_req_receiver) = mpsc::unbounded_channel();
+    let (bot_update_sender, mut bot_update_receiver) = mpsc::unbounded_channel();
 
     let mut tasks = Vec::new();
     let mut stop_signal_channels = Vec::new();
@@ -225,37 +226,58 @@ async fn main() {
             "Loaded config for ticker: {}, is crypto? {}",
             ticker_config.ticker, ticker_config.crypto
         );
-        if ticker_config.crypto {
-            let ticker = ticker_config.ticker.to_string();
-            let crypto_price_req_sender_clone = crypto_price_req_sender.clone();
-            let (stop_signal_send, stop_signal_recv) = oneshot::channel();
 
-            trace!("Spawning task for ticker: {}", ticker);
+        if !is_bot_token_valid(&ticker_config.discord_bot_token) {
+            error!(
+                "Invalid Discord bot token for ticker {}, skipping",
+                ticker_config.ticker
+            );
+            continue;
+        }
+
+        let (stop_signal_send, stop_signal_recv) = oneshot::channel();
+        let discord_client = DiscordClient::new(&ticker_config.discord_bot_token).await;
+        let ticker = ticker_config.ticker.to_string();
+
+        if ticker_config.crypto {
+            let crypto_price_req_sender_clone = crypto_price_req_sender.clone();
+            let bot_update_sender_clone = bot_update_sender.clone();
+
+            trace!("Spawning task for crypto ticker: {}", ticker);
             tasks.push(tokio::spawn(async move {
-                run_periodic_job_loop(
+                run_periodic_crypto_fetch_job_loop(
                     ticker_config,
                     stop_signal_recv,
                     crypto_price_req_sender_clone,
+                    bot_update_sender_clone,
+                    discord_client,
                 )
                 .await;
             }));
 
             trace!("Creating stop signal channel for ticker: {}", ticker);
-            stop_signal_channels.push((ticker, stop_signal_send));
         } else {
             // TODO: implement stock price fetching
             // spawn_job(ticker_config, Arc::clone(&stop_flag), stock_price_req_sender.clone());
             warn!(
-                "TBD: ticker {} is not an US stock, not implemented yet",
+                "TBD: ticker {} is not an US stock, not implemented yet, skip",
                 ticker_config.ticker
             )
         }
+
+        stop_signal_channels.push((ticker, stop_signal_send));
     }
 
     let coingecko_api_key = config.coingecko_api_key.to_string();
     trace!("Starting crypto price request consumer...");
     tokio::spawn(async move {
         consume_crypto_price_requests(crypto_price_req_receiver, coingecko_api_key).await;
+    });
+
+    tokio::spawn(async move {
+        while let Some(update) = bot_update_receiver.recv().await {
+            update.discord_client.update_bot(update.name, update.status).await;
+        }
     });
 
     // consume_stock_price_requests(stock_price_req_receiver, ...);
@@ -282,6 +304,11 @@ async fn main() {
     }
 
     info!("All tasks finished.");
+}
+
+fn is_bot_token_valid(bot_token: &str) -> bool {
+    // just check if the token is empty
+    !bot_token.trim().is_empty() && bot_token.is_ascii()
 }
 
 #[cfg(test)]
