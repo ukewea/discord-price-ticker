@@ -17,6 +17,7 @@ use tracing::error;
 use tracing::instrument;
 use tracing::Level;
 use tracing_subscriber;
+use clap::Parser;
 
 mod quote;
 mod discord;
@@ -28,6 +29,16 @@ use crate::quote::request::AssetQuoteRequest;
 use crate::bot_update::BotUpdateInfo;
 use crate::discord::client::DiscordClient;
 use crate::config::{Config, TickerConfig};
+
+/// Discord Price Ticker - Updates cryptocurrency prices on Discord servers
+#[derive(Parser, Debug)]
+#[command(name = "discord-price-ticker")]
+#[command(author, version, about, long_about = None)]
+struct Cli {
+    /// Path to the configuration file
+    #[arg(short, long, default_value = "app_config.json")]
+    config: String,
+}
 
 
 async fn read_config(file_path: &str) -> Result<Config> {
@@ -204,12 +215,15 @@ async fn main() {
         .with_max_level(Level::DEBUG)
         .init();
 
-    info!("Hello, world!");
+    let cli = Cli::parse();
 
-    let config = match read_config("app_config.json").await {
+    info!("Discord Price Ticker starting...");
+    info!("Using config file: {}", cli.config);
+
+    let config = match read_config(&cli.config).await {
         Ok(config) => config,
         Err(error) => {
-            tracing::error!("Error reading config file: {}", error);
+            tracing::error!("Error reading config file '{}': {}", cli.config, error);
             return;
         }
     };

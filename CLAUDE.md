@@ -179,9 +179,19 @@ cargo build --release  # For production
 ### Running
 
 ```bash
-# Requires app_config.json in project root
+# Default: uses app_config.json in current directory
 cargo run
+
+# Specify custom config file path
+cargo run -- --config /path/to/config.json
+cargo run -- -c custom_config.json
+
+# Show help
+cargo run -- --help
 ```
+
+**CLI Arguments:**
+- `--config, -c`: Path to configuration file (default: `app_config.json`)
 
 ### Testing
 
@@ -219,6 +229,60 @@ cargo test --all-features  # CI command
 - Include ticker symbol in log context
 - Log at appropriate levels: `trace`, `debug`, `info`, `warn`, `error`
 
+### Docker Deployment
+
+**Building the Docker image:**
+
+```bash
+# Build the image
+docker build -t discord-price-ticker:latest .
+
+# Build with specific tag
+docker build -t discord-price-ticker:v0.1.0 .
+```
+
+**Running with Docker:**
+
+```bash
+# Run with mounted config file
+docker run -v $(pwd)/app_config.json:/app/app_config.json discord-price-ticker:latest
+
+# Run with custom config path
+docker run -v $(pwd)/my_config.json:/etc/ticker/config.json \
+  discord-price-ticker:latest --config /etc/ticker/config.json
+
+# Run in detached mode with auto-restart
+docker run -d --restart unless-stopped \
+  --name price-ticker \
+  -v $(pwd)/app_config.json:/app/app_config.json \
+  discord-price-ticker:latest
+```
+
+**Docker Compose example:**
+
+```yaml
+version: '3.8'
+services:
+  discord-price-ticker:
+    build: .
+    container_name: discord-price-ticker
+    restart: unless-stopped
+    volumes:
+      - ./app_config.json:/app/app_config.json:ro
+```
+
+**Container features:**
+- Multi-stage build (small final image size)
+- Non-root user for security
+- Debian slim base with SSL support
+- Configurable via mounted config file or CLI arguments
+
+**Important notes:**
+- Config file should be mounted as read-only (`:ro`) for security
+- Container runs as non-root user (UID 1000)
+- Requires network access for CoinGecko and Discord APIs
+- No persistent storage needed (stateless application)
+
 ## Configuration
 
 ### app_config.json Structure
@@ -251,6 +315,7 @@ cargo test --all-features  # CI command
 
 ```toml
 bigdecimal = "0.4"              # Precise decimal arithmetic
+clap = { version = "4.5", features = ["derive"] }  # CLI argument parsing
 reqwest = { version = "0.12", features = ["blocking"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["arbitrary_precision"] }
@@ -263,6 +328,7 @@ serenity = { version = "0.12", features = ["full"] }  # Discord API
 ### Why These Dependencies?
 
 - **bigdecimal**: Cryptocurrency prices require arbitrary precision
+- **clap**: CLI argument parsing with derive macros for config file path
 - **tokio**: Async runtime for concurrent ticker tasks
 - **serenity**: High-level Discord API wrapper
 - **tracing**: Structured logging with spans and fields
@@ -415,11 +481,18 @@ serenity = { version = "0.12", features = ["full"] }  # Discord API
 - Guild fetch retries: `3` (src/discord/client.rs:76)
 - Guild fetch limit: `100` (src/discord/client.rs:78)
 
+### CLI Arguments
+
+- `--config, -c <PATH>`: Path to configuration file (default: `app_config.json`)
+- `--help`: Display help information
+- `--version`: Display version information
+
 ### Running Commands
 
 ```bash
 # Development
 cargo run
+cargo run -- --config custom.json
 
 # Testing
 cargo test
@@ -435,6 +508,10 @@ cargo fmt
 
 # Lint
 cargo clippy
+
+# Docker
+docker build -t discord-price-ticker .
+docker run -v $(pwd)/app_config.json:/app/app_config.json discord-price-ticker
 ```
 
 ---
